@@ -1,14 +1,10 @@
 const { nanoid } = require('nanoid');
 const Url = require('../models/url.model');
+const trackClick = require("../utils/trackClick");
+const Click = require("../models/click.model");
 
 const shorten = async (req, res) => {
   const { originalUrl, customAlias, expiresInMinutes } = req.body;
-
-  try {
-    new URL(originalUrl);
-  } catch {
-    return res.status(400).json({ error: "Invalid URL" });
-  }
 
   let expiresAt = null;
   if (expiresInMinutes !== undefined) {
@@ -27,7 +23,7 @@ const shorten = async (req, res) => {
         error: "Alias must be 3-20 characters: letters, numbers, - or _",
       });
     }
-    const reserved = ["shorten", "health", "stats"];
+    const reserved = ["shorten", "health", "stats","analytics"];
     if (reserved.includes(customAlias.toLowerCase())) {
       return res.status(400).json({ error: "This alias is reserved" });
     }
@@ -79,6 +75,7 @@ const redirect = async (req, res) => {
 
   doc.clicks += 1;
   await doc.save();
+    trackClick(req, doc.shortCode);
   res.redirect(doc.originalUrl);
 };
 
@@ -99,5 +96,81 @@ const getStats = async (req, res) => {
     expired,
   });
 };
+const getAnalytics = async (req, res) => {
+  const doc = await Url.findOne({ shortCode: req.params.code });
+  if (!doc) return res.status(404).json({ error: "Not found" });
 
-module.exports = { shorten, redirect, getStats };
+  const [result] = await Click.aggregate([
+    { $match: { shortCode: doc.shortCode } },
+    {
+      $facet: {
+        total: [{ $count: "count" }],
+        perDay: [
+          {
+            $group: {
+              _id: { $dateToString: { format: "%Y-%m-%d", date: "$clickedAt" } },
+              clicks: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+          { $project: { _id: 0, date: "$_id", clicks: 1 } },
+        ],
+        referrers: [
+          { $group: { _id: "$referrer", clicks: { $sum: 1 } } },
+          { $sort: { clicks: -1 } },
+          { $limit: 5 },
+          { $project: { _id: 0, referrer: "$_id", clicks: 1 } },
+        ],
+        browsers: [
+          {
+            $addFields: {
+              browser: {
+                $switch: {
+                  branches: [
+                    { case: { $regexMatch: { input: "$userAgent", regex: "Edg/" } }, then: "Edge" },
+                    { case: { $regexMatch: { input: "$userAgent", regex: "OPR/|Opera" } }, then: "Opera" },
+                    { case: { $regexMatch: { input: "$userAgent", regex: "Chrome/" } }, then: "Chrome" },
+                    { case: { $regexMatch: { input: "$userAgent", regex: "Firefox/" } }, then: "Firefox" },
+                    { case: { $regexMatch: { input: "$userAgent", regex: "Safari/" } }, then: "Safari" },
+                  ],
+                  default: "Other",
+                },
+              },
+            },
+          },
+          { $group: { _id: "$browser", clicks: { $sum: 1 } } },
+          { $sort: { clicks: -1 } },
+          { $project: { _id: 0, browser: "$_id", clicks: 1 } },
+        ],
+        devices: [
+          {
+            $addFields: {
+              device: {
+                $cond: [
+                  { $regexMatch: { input: "$userAgent", regex: "Mobile|Android|iPhone" } },
+                  "Mobile",
+                  "Desktop",
+                ],
+              },
+            },
+          },
+          { $group: { _id: "$device", clicks: { $sum: 1 } } },
+          { $sort: { clicks: -1 } },
+          { $project: { _id: 0, device: "$_id", clicks: 1 } },
+        ],
+      },
+    },
+  ]);
+
+  res.json({
+    shortCode: doc.shortCode,
+    originalUrl: doc.originalUrl,
+    totalClicks: result.total[0] ? result.total[0].count : 0,
+    clicksPerDay: result.perDay,
+    topReferrers: result.referrers,
+    browsers: result.browsers,
+    devices: result.devices,
+  });
+};
+
+module.exports = { shorten, redirect, getStats, getAnalytics };
